@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 
+	client_native "github.com/haproxytech/client-native/v6"
 	"github.com/haproxytech/client-native/v6/configuration"
 	"github.com/haproxytech/dataplaneapi/haproxy"
 )
@@ -48,9 +49,10 @@ type ServiceDiscoveries interface {
 
 // ServiceDiscoveriesParams contain the parameters for the service discovery initialization
 type ServiceDiscoveriesParams struct {
-	Client      configuration.Configuration
-	ReloadAgent haproxy.IReloadAgent
-	Context     context.Context
+	Client        configuration.Configuration
+	HAProxyClient client_native.HAProxyClient
+	ReloadAgent   haproxy.IReloadAgent
+	Context       context.Context
 }
 
 // NewServiceDiscoveries creates a new ServiceDiscoveries instance

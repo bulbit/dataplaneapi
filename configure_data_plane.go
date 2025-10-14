@@ -927,9 +927,10 @@ func configureAPI(api *operations.DataPlaneAPI) http.Handler { //nolint:cyclop,m
 	}
 	// set up service discovery handlers
 	discovery := service_discovery.NewServiceDiscoveries(service_discovery.ServiceDiscoveriesParams{
-		Client:      configurationClient,
-		ReloadAgent: ra,
-		Context:     ctx,
+		Client:        configurationClient,
+		HAProxyClient: client,
+		ReloadAgent:   ra,
+		Context:       ctx,
 	})
 	api.ServiceDiscoveryCreateConsulHandler = &handlers.CreateConsulHandlerImpl{Discovery: discovery, PersistCallback: cfg.SaveConsuls}
 	api.ServiceDiscoveryDeleteConsulHandler = &handlers.DeleteConsulHandlerImpl{Discovery: discovery, PersistCallback: cfg.SaveConsuls}

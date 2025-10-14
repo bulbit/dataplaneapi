@@ -26,6 +26,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	client_native "github.com/haproxytech/client-native/v6"
 	"github.com/haproxytech/client-native/v6/configuration"
 	"github.com/haproxytech/client-native/v6/models"
 
@@ -105,7 +106,7 @@ func (a awsService) GetServers() (servers []configuration.ServiceServer) {
 	return servers
 }
 
-func newAWSRegionInstance(ctx context.Context, params *models.AwsRegion, client configuration.Configuration, reloadAgent haproxy.IReloadAgent) (*awsInstance, error) {
+func newAWSRegionInstance(ctx context.Context, params *models.AwsRegion, client configuration.Configuration, haproxyClient client_native.HAProxyClient, reloadAgent haproxy.IReloadAgent) (*awsInstance, error) {
 	timeout, err := time.ParseDuration(fmt.Sprintf("%ds", *params.RetryTimeout))
 	if err != nil {
 		return nil, err
@@ -113,20 +114,23 @@ func newAWSRegionInstance(ctx context.Context, params *models.AwsRegion, client 
 
 	logFields := map[string]interface{}{"ServiceDiscovery": "AWS", "ID": *params.ID}
 
+	discoveryInstance := NewServiceDiscoveryInstance(client, reloadAgent, discoveryInstanceParams{
+		Allowlist:       []string{},
+		Denylist:        []string{},
+		LogFields:       logFields,
+		ServerSlotsBase: int(*params.ServerSlotsBase),
+		SlotsGrowthType: *params.ServerSlotsGrowthType,
+		SlotsIncrement:  int(params.ServerSlotsGrowthIncrement),
+	})
+	discoveryInstance.haproxyClient = haproxyClient
+
 	ai := &awsInstance{
-		params:    params,
-		timeout:   timeout,
-		ctx:       ctx,
-		logFields: logFields,
-		state:     make(map[string]map[string]time.Time),
-		discoveryConfig: NewServiceDiscoveryInstance(client, reloadAgent, discoveryInstanceParams{
-			Allowlist:       []string{},
-			Denylist:        []string{},
-			LogFields:       logFields,
-			ServerSlotsBase: int(*params.ServerSlotsBase),
-			SlotsGrowthType: *params.ServerSlotsGrowthType,
-			SlotsIncrement:  int(params.ServerSlotsGrowthIncrement),
-		}),
+		params:          params,
+		timeout:         timeout,
+		ctx:             ctx,
+		logFields:       logFields,
+		state:           make(map[string]map[string]time.Time),
+		discoveryConfig: discoveryInstance,
 	}
 	if err = ai.updateTimeout(*params.RetryTimeout); err != nil {
 		return nil, err

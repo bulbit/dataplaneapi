@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	client_native "github.com/haproxytech/client-native/v6"
 	"github.com/haproxytech/client-native/v6/configuration"
 	"github.com/haproxytech/client-native/v6/models"
 	"github.com/haproxytech/dataplaneapi/haproxy"
@@ -29,6 +30,7 @@ import (
 type consulServiceDiscovery struct {
 	consulServices Store
 	client         configuration.Configuration
+	haproxyClient  client_native.HAProxyClient
 	reloadAgent    haproxy.IReloadAgent
 	context        context.Context
 }
@@ -38,6 +40,7 @@ func NewConsulDiscoveryService(params ServiceDiscoveriesParams) ServiceDiscovery
 	return &consulServiceDiscovery{
 		consulServices: NewInstanceStore(),
 		client:         params.Client,
+		haproxyClient:  params.HAProxyClient,
 		reloadAgent:    params.ReloadAgent,
 		context:        params.Context,
 	}
@@ -57,20 +60,23 @@ func (c *consulServiceDiscovery) AddNode(id string, params ServiceDiscoveryParam
 
 	logFields := map[string]interface{}{"ServiceDiscovery": "Consul", "ID": *cParams.ID}
 
+	discoveryInstance := NewServiceDiscoveryInstance(c.client, c.reloadAgent, discoveryInstanceParams{
+		Allowlist:       cParams.ServiceAllowlist,
+		Denylist:        cParams.ServiceDenylist,
+		LogFields:       logFields,
+		ServerSlotsBase: int(*cParams.ServerSlotsBase),
+		SlotsGrowthType: *cParams.ServerSlotsGrowthType,
+		SlotsIncrement:  int(cParams.ServerSlotsGrowthIncrement),
+	})
+	discoveryInstance.haproxyClient = c.haproxyClient
+
 	instance := &consulInstance{
-		params:  cParams,
-		ctx:     c.context,
-		timeout: timeout,
-		discoveryConfig: NewServiceDiscoveryInstance(c.client, c.reloadAgent, discoveryInstanceParams{
-			Allowlist:       cParams.ServiceAllowlist,
-			Denylist:        cParams.ServiceDenylist,
-			LogFields:       logFields,
-			ServerSlotsBase: int(*cParams.ServerSlotsBase),
-			SlotsGrowthType: *cParams.ServerSlotsGrowthType,
-			SlotsIncrement:  int(cParams.ServerSlotsGrowthIncrement),
-		}),
-		prevIndexes: make(map[string]uint64),
-		logFields:   logFields,
+		params:          cParams,
+		ctx:             c.context,
+		timeout:         timeout,
+		discoveryConfig: discoveryInstance,
+		prevIndexes:     make(map[string]uint64),
+		logFields:       logFields,
 	}
 
 	if err = c.consulServices.Create(id, instance); err != nil {

@@ -16,9 +16,15 @@
 package discovery
 
 import (
+	"fmt"
+	"regexp"
+	"strings"
 	"sync"
 
+	client_native "github.com/haproxytech/client-native/v6"
 	"github.com/haproxytech/client-native/v6/configuration"
+	"github.com/haproxytech/client-native/v6/models"
+	cn_runtime "github.com/haproxytech/client-native/v6/runtime"
 
 	"github.com/haproxytech/dataplaneapi/haproxy"
 	"github.com/haproxytech/dataplaneapi/log"
@@ -54,8 +60,10 @@ type discoveryInstanceParams struct {
 // ServiceDiscoveryInstance manages and updates all services of a single service discovery.
 type ServiceDiscoveryInstance struct {
 	client        configuration.Configuration
+	haproxyClient client_native.HAProxyClient
 	reloadAgent   haproxy.IReloadAgent
 	services      map[string]*confService
+	serverStates  map[string]map[string]bool // backendName -> serverName -> exists
 	transactionID string
 	params        discoveryInstanceParams
 }
@@ -63,10 +71,11 @@ type ServiceDiscoveryInstance struct {
 // NewServiceDiscoveryInstance creates a new ServiceDiscoveryInstance.
 func NewServiceDiscoveryInstance(client configuration.Configuration, reloadAgent haproxy.IReloadAgent, params discoveryInstanceParams) *ServiceDiscoveryInstance {
 	return &ServiceDiscoveryInstance{
-		client:      client,
-		reloadAgent: reloadAgent,
-		params:      params,
-		services:    make(map[string]*confService),
+		client:       client,
+		reloadAgent:  reloadAgent,
+		params:       params,
+		services:     make(map[string]*confService),
+		serverStates: make(map[string]map[string]bool),
 	}
 }
 
@@ -86,11 +95,116 @@ func (s *ServiceDiscoveryInstance) UpdateParams(params discoveryInstanceParams) 
 	return nil
 }
 
-// UpdateServices updates each service and persists the changes inside a single transaction.
+// UpdateServices updates each service dynamically via Runtime API without reloading HAProxy.
+// Falls back to configuration file update and reload only if Runtime API fails.
 func (s *ServiceDiscoveryInstance) UpdateServices(services []ServiceInstance) error {
 	mutex.Lock()
 	defer mutex.Unlock()
 
+	// Try to use Runtime API first
+	if s.haproxyClient != nil {
+		if err := s.updateServicesViaRuntime(services); err != nil {
+			s.logWarningf("Runtime API update failed: %s, falling back to config file update", err.Error())
+		} else {
+			// Successfully updated via Runtime API
+			return nil
+		}
+	}
+
+	// Fallback: traditional config file update with reload
+	return s.updateServicesViaConfigFile(services)
+}
+
+// updateServicesViaRuntime updates services dynamically using Runtime API
+func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceInstance) error {
+	runtime, err := s.haproxyClient.Runtime()
+	if err != nil {
+		return fmt.Errorf("failed to get runtime client: %w", err)
+	}
+
+	haversion, err := runtime.GetVersion()
+	if err != nil {
+		return fmt.Errorf("failed to get HAProxy version: %w", err)
+	}
+
+	s.markForCleanUp()
+
+	for _, service := range services {
+		if s.serviceNotTracked(service.GetName()) {
+			continue
+		}
+
+		backendName := service.GetBackendName()
+
+		// Initialize backend state tracking if not exists
+		if _, ok := s.serverStates[backendName]; !ok {
+			s.serverStates[backendName] = make(map[string]bool)
+		}
+
+		if !service.Changed() {
+			if se, ok := s.services[service.GetName()]; ok {
+				se.cleanup = false
+			}
+			continue
+		}
+
+		// Ensure backend exists (this may still require config file update on first run)
+		if _, err := s.initService(service); err != nil {
+			return fmt.Errorf("failed to init service %s: %w", service.GetName(), err)
+		}
+
+		se := s.services[service.GetName()]
+		se.cleanup = false
+
+		desiredServers := service.GetServers()
+		currentServers := s.serverStates[backendName]
+
+		// Create a map of desired servers
+		desiredServerMap := make(map[string]configuration.ServiceServer)
+		for _, srv := range desiredServers {
+			serverName := s.generateServerName(srv.Address, srv.Port)
+			desiredServerMap[serverName] = srv
+		}
+
+		// Add new servers and update existing ones
+		for serverName, srv := range desiredServerMap {
+			if !currentServers[serverName] {
+				// Add new server via Runtime API
+				if err := s.addServerViaRuntime(runtime, backendName, serverName, srv, &haversion); err != nil {
+					s.logErrorf("Failed to add server %s to backend %s: %s", serverName, backendName, err.Error())
+					return err
+				}
+				s.serverStates[backendName][serverName] = true
+				log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Added server %s to backend %s via Runtime API", serverName, backendName)
+			} else {
+				// Server exists, update address if needed via Runtime API
+				if err := s.updateServerViaRuntime(runtime, backendName, serverName, srv); err != nil {
+					s.logWarningf("Failed to update server %s in backend %s: %s", serverName, backendName, err.Error())
+				}
+			}
+		}
+
+		// Remove servers that no longer exist
+		for serverName := range currentServers {
+			if _, exists := desiredServerMap[serverName]; !exists {
+				if err := s.deleteServerViaRuntime(runtime, backendName, serverName); err != nil {
+					s.logWarningf("Failed to delete server %s from backend %s: %s", serverName, backendName, err.Error())
+				} else {
+					delete(s.serverStates[backendName], serverName)
+					log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Deleted server %s from backend %s via Runtime API", serverName, backendName)
+				}
+			}
+		}
+	}
+
+	// Note: Cleanup of services no longer tracked is handled separately
+	// This requires config file update as we need to remove the entire backend
+
+	return nil
+}
+
+// updateServicesViaConfigFile updates services via traditional config file update (fallback)
+func (s *ServiceDiscoveryInstance) updateServicesViaConfigFile(services []ServiceInstance) error {
 	err := s.startTransaction()
 	if err != nil {
 		return err
@@ -235,4 +349,90 @@ func (s *ServiceDiscoveryInstance) logWarningf(format string, args ...interface{
 
 func (s *ServiceDiscoveryInstance) logErrorf(format string, args ...interface{}) {
 	log.WithFieldsf(s.params.LogFields, log.ErrorLevel, format, args...)
+}
+
+// generateServerName generates a unique server name from address and port
+func (s *ServiceDiscoveryInstance) generateServerName(address string, port *int64) string {
+	// Sanitize address to be a valid server name (replace dots and colons with dashes)
+	sanitized := sanitizeHostname(address)
+	if port != nil {
+		return fmt.Sprintf("sd-%s-%d", sanitized, *port)
+	}
+	return fmt.Sprintf("sd-%s", sanitized)
+}
+
+// sanitizeHostname replaces invalid characters in hostname for use as server name
+func sanitizeHostname(hostname string) string {
+	// Replace dots, colons, and other special chars with dashes
+	re := regexp.MustCompile(`[^a-zA-Z0-9-]`)
+	return re.ReplaceAllString(hostname, "-")
+}
+
+// addServerViaRuntime adds a server via Runtime API
+func (s *ServiceDiscoveryInstance) addServerViaRuntime(runtime cn_runtime.Runtime, backendName, serverName string, srv configuration.ServiceServer, haversion *cn_runtime.HAProxyVersion) error {
+	ras := &models.RuntimeAddServer{
+		Name:    serverName,
+		Address: srv.Address,
+		Port:    srv.Port,
+		Check:   "enabled", // Enable health checks by default
+	}
+
+	serialized := serializeRuntimeAddServer(ras, haversion)
+	return runtime.AddServer(backendName, serverName, serialized)
+}
+
+// updateServerViaRuntime updates a server's address via Runtime API
+func (s *ServiceDiscoveryInstance) updateServerViaRuntime(runtime cn_runtime.Runtime, backendName, serverName string, srv configuration.ServiceServer) error {
+	port := 0
+	if srv.Port != nil {
+		port = int(*srv.Port)
+	}
+	return runtime.SetServerAddr(backendName, serverName, srv.Address, port)
+}
+
+// deleteServerViaRuntime deletes a server via Runtime API
+func (s *ServiceDiscoveryInstance) deleteServerViaRuntime(runtime cn_runtime.Runtime, backendName, serverName string) error {
+	// Put server in maintenance before deleting
+	if err := runtime.DisableServer(backendName, serverName); err != nil {
+		// If server doesn't exist, that's ok
+		if !isRuntimeNotFoundError(err) {
+			return err
+		}
+	}
+	return runtime.DeleteServer(backendName, serverName)
+}
+
+// isRuntimeNotFoundError checks if error is a "not found" error
+func isRuntimeNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errMsg := err.Error()
+	return strings.Contains(errMsg, "No such server") || strings.Contains(errMsg, "not found")
+}
+
+// serializeRuntimeAddServer converts RuntimeAddServer to HAProxy runtime command format
+// This is a simplified version for Service Discovery use case
+func serializeRuntimeAddServer(srv *models.RuntimeAddServer, haversion *cn_runtime.HAProxyVersion) string {
+	var parts []string
+
+	// Address is mandatory
+	addr := srv.Address
+	if srv.Port != nil {
+		addr = fmt.Sprintf("%s:%d", addr, *srv.Port)
+	}
+	parts = append(parts, addr)
+
+	// Add health check if enabled
+	if srv.Check == "enabled" {
+		parts = append(parts, "check")
+	}
+
+	// Add inter if specified
+	if srv.Inter != nil {
+		parts = append(parts, fmt.Sprintf("inter %d", *srv.Inter))
+	}
+
+	// Return space-separated string with leading space
+	return " " + strings.Join(parts, " ")
 }
