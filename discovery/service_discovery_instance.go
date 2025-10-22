@@ -122,13 +122,22 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 		return fmt.Errorf("failed to get runtime client: %w", err)
 	}
 
+	// Log socket path for debugging
+	socketPath := runtime.SocketPath()
+	isStatsSocket := runtime.IsStatsSocket()
+	s.logWarningf("Runtime API using socket: %s (isStatsSocket: %t)", socketPath, isStatsSocket)
+
 	// Try to get HAProxy version, but continue if it fails since our
 	// serializeRuntimeAddServer implementation doesn't actually use it
 	haversion, err := runtime.GetVersion()
 	if err != nil {
 		// Create a default version mimicking 3.2.0 to avoid nil pointer issues
 		haversion = cn_runtime.HAProxyVersion{Major: 3, Minor: 2, Patch: 0}
-		s.logWarningf("Failed to get HAProxy version, continuing with default (Major=%d, Minor=%d, Patch=%d): %s", haversion.Major, haversion.Minor, haversion.Patch, err.Error())
+		s.logWarningf("Failed to get HAProxy version, continuing with default version (Major=%d, Minor=%d, Patch=%d): %s", haversion.Major, haversion.Minor, haversion.Patch, err.Error())
+
+		// Since we can't set the version on the runtime client, and AddServer will likely fail
+		// with version checks, we should return an error to fallback to config file method
+		return fmt.Errorf("runtime version unavailable, cannot use Runtime API: %w", err)
 	} else {
 		s.logWarningf("Successfully retrieved HAProxy version: Major=%d, Minor=%d, Patch=%d", haversion.Major, haversion.Minor, haversion.Patch)
 	}
