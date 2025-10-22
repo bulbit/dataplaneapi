@@ -135,6 +135,32 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 		haversion = cn_runtime.HAProxyVersion{Major: 3, Minor: 2, Patch: 0}
 		s.logWarningf("Failed to get HAProxy version, continuing with default version (Major=%d, Minor=%d, Patch=%d): %s", haversion.Major, haversion.Minor, haversion.Patch, err.Error())
 
+		// Try to debug with raw commands
+		if !isStatsSocket {
+			s.logWarningf("Attempting to get version via raw command for master socket")
+			if rawResult, rawErr := runtime.ExecuteRaw("@0 show info"); rawErr == nil {
+				maxLen := 200
+				if len(rawResult) < maxLen {
+					maxLen = len(rawResult)
+				}
+				s.logWarningf("Raw '@0 show info' result: %s", rawResult[:maxLen])
+			} else {
+				s.logWarningf("Raw '@0 show info' failed: %s", rawErr.Error())
+			}
+		}
+
+		// Also try direct show info command (works for stats socket)
+		s.logWarningf("Attempting to get version via raw 'show info' command")
+		if rawResult, rawErr := runtime.ExecuteRaw("show info"); rawErr == nil {
+			maxLen := 200
+			if len(rawResult) < maxLen {
+				maxLen = len(rawResult)
+			}
+			s.logWarningf("Raw 'show info' result: %s", rawResult[:maxLen])
+		} else {
+			s.logWarningf("Raw 'show info' failed: %s", rawErr.Error())
+		}
+
 		// Since we can't set the version on the runtime client, and AddServer will likely fail
 		// with version checks, we should return an error to fallback to config file method
 		return fmt.Errorf("runtime version unavailable, cannot use Runtime API: %w", err)
