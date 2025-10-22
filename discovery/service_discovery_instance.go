@@ -161,6 +161,23 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 			s.logWarningf("Raw 'show info' failed: %s", rawErr.Error())
 		}
 
+		// Try other worker IDs to see if any work
+		s.logWarningf("Trying different worker commands to debug master socket behavior")
+		for workerID := 0; workerID <= 2; workerID++ {
+			cmd := fmt.Sprintf("@%d show info", workerID)
+			s.logWarningf("Executing raw command: '%s'", cmd)
+			if rawResult, rawErr := runtime.ExecuteRaw(cmd); rawErr == nil {
+				maxLen := 100
+				if len(rawResult) < maxLen {
+					maxLen = len(rawResult)
+				}
+				s.logWarningf("Worker %d result: %s", workerID, rawResult[:maxLen])
+				break // Stop on first successful worker
+			} else {
+				s.logWarningf("Worker %d failed: %s", workerID, rawErr.Error())
+			}
+		}
+
 		// Since we can't set the version on the runtime client, and AddServer will likely fail
 		// with version checks, we should return an error to fallback to config file method
 		return fmt.Errorf("runtime version unavailable, cannot use Runtime API: %w", err)
