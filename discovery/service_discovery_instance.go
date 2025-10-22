@@ -135,48 +135,8 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 		haversion = cn_runtime.HAProxyVersion{Major: 3, Minor: 2, Patch: 0}
 		s.logWarningf("Failed to get HAProxy version, continuing with default version (Major=%d, Minor=%d, Patch=%d): %s", haversion.Major, haversion.Minor, haversion.Patch, err.Error())
 
-		// Try to debug with raw commands
-		if !isStatsSocket {
-			s.logWarningf("Attempting to get version via raw command for master socket")
-			if rawResult, rawErr := runtime.ExecuteRaw("@0 show info"); rawErr == nil {
-				maxLen := 200
-				if len(rawResult) < maxLen {
-					maxLen = len(rawResult)
-				}
-				s.logWarningf("Raw '@0 show info' result: %s", rawResult[:maxLen])
-			} else {
-				s.logWarningf("Raw '@0 show info' failed: %s", rawErr.Error())
-			}
-		}
-
-		// Also try direct show info command (works for stats socket)
-		s.logWarningf("Attempting to get version via raw 'show info' command")
-		if rawResult, rawErr := runtime.ExecuteRaw("show info"); rawErr == nil {
-			maxLen := 200
-			if len(rawResult) < maxLen {
-				maxLen = len(rawResult)
-			}
-			s.logWarningf("Raw 'show info' result: %s", rawResult[:maxLen])
-		} else {
-			s.logWarningf("Raw 'show info' failed: %s", rawErr.Error())
-		}
-
-		// Try other worker IDs to see if any work
-		s.logWarningf("Trying different worker commands to debug master socket behavior")
-		for workerID := 0; workerID <= 2; workerID++ {
-			cmd := fmt.Sprintf("@%d show info", workerID)
-			s.logWarningf("Executing raw command: '%s'", cmd)
-			if rawResult, rawErr := runtime.ExecuteRaw(cmd); rawErr == nil {
-				maxLen := 100
-				if len(rawResult) < maxLen {
-					maxLen = len(rawResult)
-				}
-				s.logWarningf("Worker %d result: %s", workerID, rawResult[:maxLen])
-				break // Stop on first successful worker
-			} else {
-				s.logWarningf("Worker %d failed: %s", workerID, rawErr.Error())
-			}
-		}
+		// Note: GetVersion() failed, likely due to client-native library issue with master socket handling
+		// This is a known issue where the library incorrectly routes commands to non-existent workers
 
 		// Since we can't set the version on the runtime client, and AddServer will likely fail
 		// with version checks, we should return an error to fallback to config file method
