@@ -126,9 +126,11 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 	// serializeRuntimeAddServer implementation doesn't actually use it
 	haversion, err := runtime.GetVersion()
 	if err != nil {
-		// Create a default empty version to avoid nil pointer issues
-		haversion = cn_runtime.HAProxyVersion{}
+		// Create a default version mimicking 3.2.0 to avoid nil pointer issues
+		haversion = cn_runtime.HAProxyVersion{Major: 3, Minor: 2, Patch: 0}
 		s.logWarningf("Failed to get HAProxy version, continuing with default (Major=%d, Minor=%d, Patch=%d): %s", haversion.Major, haversion.Minor, haversion.Patch, err.Error())
+	} else {
+		s.logWarningf("Successfully retrieved HAProxy version: Major=%d, Minor=%d, Patch=%d", haversion.Major, haversion.Minor, haversion.Patch)
 	}
 
 	s.markForCleanUp()
