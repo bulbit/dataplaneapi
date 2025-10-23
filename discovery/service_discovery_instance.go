@@ -522,6 +522,7 @@ func (s *ServiceDiscoveryInstance) getBackendHealthCheckDefaults(backendName str
 func (s *ServiceDiscoveryInstance) addServerViaRuntime(runtime cn_runtime.Runtime, backendName, serverName string, srv configuration.ServiceServer, haversion *cn_runtime.HAProxyVersion) error {
 	// Get health check defaults from backend configuration
 	inter, rise, fall := s.getBackendHealthCheckDefaults(backendName)
+	s.logWarningf("Health check defaults for backend %s: inter=%d, rise=%d, fall=%d", backendName, *inter, *rise, *fall)
 
 	ras := &models.RuntimeAddServer{
 		Name:    serverName,
@@ -534,12 +535,17 @@ func (s *ServiceDiscoveryInstance) addServerViaRuntime(runtime cn_runtime.Runtim
 	}
 
 	serialized := serializeRuntimeAddServer(ras, haversion)
+	s.logWarningf("Adding server %s to backend %s with command: %s", serverName, backendName, serialized)
 	if err := runtime.AddServer(backendName, serverName, serialized); err != nil {
+		s.logErrorf("Failed to add server %s to backend %s: %s", serverName, backendName, err.Error())
 		return err
 	}
+	s.logWarningf("Successfully added server %s to backend %s", serverName, backendName)
 
 	// Servers are added in MAINT state by default, need to enable them
+	s.logWarningf("Enabling server %s in backend %s", serverName, backendName)
 	if err := runtime.EnableServer(backendName, serverName); err != nil {
+		s.logErrorf("Failed to enable server %s in backend %s: %s", serverName, backendName, err.Error())
 		// If enable fails, try to clean up by deleting the server
 		_ = runtime.DeleteServer(backendName, serverName)
 		return fmt.Errorf("failed to enable server after adding: %w", err)
