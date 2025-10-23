@@ -149,6 +149,12 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 		}
 	}
 
+	// Try to get HAProxy version
+	haversion, err := runtime.GetVersion()
+	if err != nil {
+		s.logWarningf("Failed to get HAProxy version, continuing with default version (Major=%d, Minor=%d, Patch=%d): %s", haversion.Major, haversion.Minor, haversion.Patch, err.Error())
+	}
+
 	s.markForCleanUp()
 
 	for _, service := range services {
