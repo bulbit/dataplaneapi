@@ -536,6 +536,7 @@ func (s *ServiceDiscoveryInstance) addServerViaRuntime(runtime cn_runtime.Runtim
 
 	serialized := serializeRuntimeAddServer(ras, haversion)
 	s.logWarningf("Adding server %s to backend %s with command: %s", serverName, backendName, serialized)
+	s.logWarningf("Full runtime command will be: 'add server %s/%s%s'", backendName, serverName, serialized)
 	if err := runtime.AddServer(backendName, serverName, serialized); err != nil {
 		s.logErrorf("Failed to add server %s to backend %s: %s", serverName, backendName, err.Error())
 		return err
@@ -603,7 +604,7 @@ func serializeRuntimeAddServer(srv *models.RuntimeAddServer, haversion *cn_runti
 
 	// Add check interval if specified
 	if srv.Inter != nil {
-		parts = append(parts, fmt.Sprintf("inter %d", *srv.Inter))
+		parts = append(parts, fmt.Sprintf("inter %dms", *srv.Inter))
 	}
 
 	// Add rise threshold (number of successful checks before UP)
