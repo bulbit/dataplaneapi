@@ -127,11 +127,6 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 		return fmt.Errorf("failed to get runtime client: %w", err)
 	}
 
-	// Log socket path for debugging
-	socketPath := runtime.SocketPath()
-	isStatsSocket := runtime.IsStatsSocket()
-	s.logWarningf("Runtime API using socket: %s (isStatsSocket: %t)", socketPath, isStatsSocket)
-
 	// Initialize serverStates by reading current runtime state from HAProxy
 	// This ensures we track existing servers (including those from config file)
 	for _, service := range services {
@@ -148,7 +143,6 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 			} else {
 				for _, srv := range existingServers {
 					s.serverStates[backendName][srv.Name] = true
-					s.logWarningf("Found existing server %s in backend %s (address: %s)", srv.Name, backendName, srv.Address)
 				}
 			}
 		}
@@ -506,8 +500,6 @@ func (s *ServiceDiscoveryInstance) getBackendConfiguration(backendName string) *
 	// Check if backend uses HTTP health checks
 	if backend.AdvCheck == "httpchk" && backend.HttpchkParams != nil {
 		config.UseHTTP = true
-		s.logWarningf("Backend %s uses HTTP health checks: %s %s %s",
-			backendName, backend.HttpchkParams.Method, backend.HttpchkParams.URI, backend.HttpchkParams.Version)
 	}
 
 	// Read from backend's default-server directive if available
@@ -546,20 +538,6 @@ func (s *ServiceDiscoveryInstance) getBackendConfiguration(backendName string) *
 		}
 	}
 
-	s.logWarningf("Backend %s configuration: inter=%dms, rise=%d, fall=%d, http=%t",
-		backendName, *config.Inter, *config.Rise, *config.Fall, config.UseHTTP)
-
-	// Log additional inherited settings if present
-	if config.Weight != nil {
-		s.logWarningf("Backend %s: default server weight=%d", backendName, *config.Weight)
-	}
-	if config.Maxconn != nil {
-		s.logWarningf("Backend %s: default server maxconn=%d", backendName, *config.Maxconn)
-	}
-	if config.HealthCheckAddr != "" {
-		s.logWarningf("Backend %s: custom health check address=%s", backendName, config.HealthCheckAddr)
-	}
-
 	return config
 }
 
@@ -596,33 +574,22 @@ func (s *ServiceDiscoveryInstance) addServerViaRuntime(runtime cn_runtime.Runtim
 		ras.HealthCheckPort = backendConfig.HealthCheckPort
 	}
 
-	// Log if backend uses HTTP health checks (no special configuration needed for Runtime API)
-	if backendConfig.UseHTTP {
-		s.logWarningf("Configuring server %s with HTTP health checks to match backend's HTTP check configuration", serverName)
-	}
-
 	serialized := serializeRuntimeAddServer(ras, haversion)
-	s.logWarningf("Adding server %s to backend %s with command: %s", serverName, backendName, serialized)
-	s.logWarningf("Full runtime command will be: 'add server %s/%s%s'", backendName, serverName, serialized)
 	if err := runtime.AddServer(backendName, serverName, serialized); err != nil {
 		s.logErrorf("Failed to add server %s to backend %s: %s", serverName, backendName, err.Error())
 		return err
 	}
-	s.logWarningf("Successfully added server %s to backend %s", serverName, backendName)
-
-	// Check server state immediately after adding
-	if serverState, err := runtime.GetServerState(backendName, serverName); err == nil {
-		s.logWarningf("Server %s state after adding: AdminState=%s, OperationalState=%s",
-			serverName, serverState.AdminState, serverState.OperationalState)
-	}
 
 	// Servers are added in MAINT state by default, need to enable them
-	s.logWarningf("Enabling server %s in backend %s", serverName, backendName)
 	if err := runtime.EnableServer(backendName, serverName); err != nil {
 		s.logErrorf("Failed to enable server %s in backend %s: %s", serverName, backendName, err.Error())
-		// If enable fails, try to clean up by deleting the server
 		_ = runtime.DeleteServer(backendName, serverName)
 		return fmt.Errorf("failed to enable server after adding: %w", err)
+	}
+
+	// Enable health checks for the server
+	if err := runtime.EnableServerHealth(backendName, serverName); err != nil {
+		s.logErrorf("Failed to enable health checks for server %s in backend %s: %s", serverName, backendName, err.Error())
 	}
 
 	return nil
