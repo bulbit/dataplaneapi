@@ -115,7 +115,12 @@ func (s *ServiceDiscoveryInstance) UpdateServices(services []ServiceInstance) er
 	return s.updateServicesViaConfigFile(services)
 }
 
-// updateServicesViaRuntime updates services dynamically using Runtime API
+// updateServicesViaRuntime updates services dynamically using Runtime API for immediate effect
+// and also persists changes to the configuration file to survive HAProxy reloads.
+// This approach provides:
+// 1. Immediate updates via Runtime API (no reload needed)
+// 2. Persistent configuration in haproxy.cfg for true reload scenarios
+// 3. Conditional updates - only updates servers when there are actual changes
 func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceInstance) error {
 	runtime, err := s.haproxyClient.Runtime()
 	if err != nil {
@@ -155,7 +160,14 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 		s.logWarningf("Failed to get HAProxy version, continuing with default version (Major=%d, Minor=%d, Patch=%d): %s", haversion.Major, haversion.Minor, haversion.Patch, err.Error())
 	}
 
+	// Start a configuration transaction to persist changes to config file
+	if err := s.startTransaction(); err != nil {
+		return fmt.Errorf("failed to start transaction: %w", err)
+	}
+
 	s.markForCleanUp()
+
+	configChanged := false
 
 	for _, service := range services {
 		if s.serviceNotTracked(service.GetName()) {
@@ -173,6 +185,7 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 
 		// Ensure backend exists (this may still require config file update on first run)
 		if _, err := s.initService(service); err != nil {
+			s.deleteTransaction()
 			return fmt.Errorf("failed to init service %s: %w", service.GetName(), err)
 		}
 
@@ -214,6 +227,7 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 				serverName := s.generateServerName(srv.Address, srv.Port)
 				if err := s.addServerViaRuntime(runtime, backendName, serverName, srv, &haversion); err != nil {
 					s.logErrorf("Failed to add server %s (%s) to backend %s: %s", serverName, addr, backendName, err.Error())
+					s.deleteTransaction()
 					return err
 				}
 				log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Added server %s (%s) to backend %s via Runtime API", serverName, addr, backendName)
@@ -239,10 +253,29 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 				}
 			}
 		}
+
+		// Update the configuration file with the desired servers
+		changed, err := se.confService.Update(desiredServers)
+		if err != nil {
+			s.deleteTransaction()
+			return fmt.Errorf("failed to update config for service %s: %w", service.GetName(), err)
+		}
+		configChanged = configChanged || changed
 	}
 
-	// Note: Cleanup of services no longer tracked is handled separately
-	// This requires config file update as we need to remove the entire backend
+	// Cleanup services no longer tracked
+	cleanupChanged := s.cleanup()
+	configChanged = configChanged || cleanupChanged
+
+	// Commit the configuration transaction if there were changes
+	if configChanged {
+		if err := s.commitTransaction(); err != nil {
+			return fmt.Errorf("failed to commit transaction: %w", err)
+		}
+		log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Configuration file updated with runtime changes")
+	} else {
+		s.deleteTransaction()
+	}
 
 	return nil
 }
