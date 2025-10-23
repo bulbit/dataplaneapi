@@ -230,7 +230,7 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 					s.deleteTransaction()
 					return err
 				}
-				log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Added server %s (%s) to backend %s via Runtime API", serverName, addr, backendName)
+				log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Added and enabled server %s (%s) to backend %s via Runtime API", serverName, addr, backendName)
 			} else {
 				// Server exists with this address, check if update is needed
 				if s.serverNeedsUpdate(existingServer, srv) {
@@ -472,7 +472,7 @@ func (s *ServiceDiscoveryInstance) serverNeedsUpdate(current *models.RuntimeServ
 	return false
 }
 
-// addServerViaRuntime adds a server via Runtime API
+// addServerViaRuntime adds a server via Runtime API and enables it
 func (s *ServiceDiscoveryInstance) addServerViaRuntime(runtime cn_runtime.Runtime, backendName, serverName string, srv configuration.ServiceServer, haversion *cn_runtime.HAProxyVersion) error {
 	ras := &models.RuntimeAddServer{
 		Name:    serverName,
@@ -482,7 +482,18 @@ func (s *ServiceDiscoveryInstance) addServerViaRuntime(runtime cn_runtime.Runtim
 	}
 
 	serialized := serializeRuntimeAddServer(ras, haversion)
-	return runtime.AddServer(backendName, serverName, serialized)
+	if err := runtime.AddServer(backendName, serverName, serialized); err != nil {
+		return err
+	}
+
+	// Servers are added in MAINT state by default, need to enable them
+	if err := runtime.EnableServer(backendName, serverName); err != nil {
+		// If enable fails, try to clean up by deleting the server
+		_ = runtime.DeleteServer(backendName, serverName)
+		return fmt.Errorf("failed to enable server after adding: %w", err)
+	}
+
+	return nil
 }
 
 // updateServerViaRuntime updates a server's address via Runtime API
