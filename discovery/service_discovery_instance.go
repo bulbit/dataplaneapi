@@ -472,13 +472,65 @@ func (s *ServiceDiscoveryInstance) serverNeedsUpdate(current *models.RuntimeServ
 	return false
 }
 
+// getBackendHealthCheckDefaults retrieves health check defaults from backend's default-server directive
+func (s *ServiceDiscoveryInstance) getBackendHealthCheckDefaults(backendName string) (inter, rise, fall *int64) {
+	// Default fallback values (HAProxy defaults)
+	defaultInter := int64(2000) // 2 seconds
+	defaultRise := int64(2)     // 2 successful checks
+	defaultFall := int64(3)     // 3 failed checks
+
+	// Try to get backend configuration
+	_, backend, err := s.client.GetBackend(backendName, "")
+	if err != nil {
+		// If we can't get backend config, use defaults
+		return &defaultInter, &defaultRise, &defaultFall
+	}
+
+	// Read from backend's default-server directive if available
+	if backend.DefaultServer != nil {
+		// Get inter (check interval) from default-server
+		if backend.DefaultServer.Inter != nil && *backend.DefaultServer.Inter > 0 {
+			inter = backend.DefaultServer.Inter
+		}
+
+		// Get rise (consecutive successful checks before UP) from default-server
+		if backend.DefaultServer.Rise != nil && *backend.DefaultServer.Rise > 0 {
+			rise = backend.DefaultServer.Rise
+		}
+
+		// Get fall (consecutive failed checks before DOWN) from default-server
+		if backend.DefaultServer.Fall != nil && *backend.DefaultServer.Fall > 0 {
+			fall = backend.DefaultServer.Fall
+		}
+	}
+
+	// Fall back to hardcoded defaults if not specified in backend
+	if inter == nil {
+		inter = &defaultInter
+	}
+	if rise == nil {
+		rise = &defaultRise
+	}
+	if fall == nil {
+		fall = &defaultFall
+	}
+
+	return inter, rise, fall
+}
+
 // addServerViaRuntime adds a server via Runtime API and enables it
 func (s *ServiceDiscoveryInstance) addServerViaRuntime(runtime cn_runtime.Runtime, backendName, serverName string, srv configuration.ServiceServer, haversion *cn_runtime.HAProxyVersion) error {
+	// Get health check defaults from backend configuration
+	inter, rise, fall := s.getBackendHealthCheckDefaults(backendName)
+
 	ras := &models.RuntimeAddServer{
 		Name:    serverName,
 		Address: srv.Address,
 		Port:    srv.Port,
-		Check:   "enabled", // Enable health checks by default
+		Check:   "enabled", // Enable health checks
+		Inter:   inter,     // Check interval from backend config
+		Rise:    rise,      // Rise threshold from backend config
+		Fall:    fall,      // Fall threshold from backend config
 	}
 
 	serialized := serializeRuntimeAddServer(ras, haversion)
@@ -527,25 +579,35 @@ func isRuntimeNotFoundError(err error) bool {
 }
 
 // serializeRuntimeAddServer converts RuntimeAddServer to HAProxy runtime command format
-// This is a simplified version for Service Discovery use case
+// This serializes server parameters for the "add server" runtime command
 func serializeRuntimeAddServer(srv *models.RuntimeAddServer, haversion *cn_runtime.HAProxyVersion) string {
-	var parts []string
+	parts := []string{}
 
-	// Address is mandatory
+	// Address is mandatory and must come first
 	addr := srv.Address
 	if srv.Port != nil {
 		addr = fmt.Sprintf("%s:%d", addr, *srv.Port)
 	}
 	parts = append(parts, addr)
 
-	// Add health check if enabled
+	// Add health check
 	if srv.Check == "enabled" {
 		parts = append(parts, "check")
 	}
 
-	// Add inter if specified
+	// Add check interval if specified
 	if srv.Inter != nil {
 		parts = append(parts, fmt.Sprintf("inter %d", *srv.Inter))
+	}
+
+	// Add rise threshold (number of successful checks before UP)
+	if srv.Rise != nil {
+		parts = append(parts, fmt.Sprintf("rise %d", *srv.Rise))
+	}
+
+	// Add fall threshold (number of failed checks before DOWN)
+	if srv.Fall != nil {
+		parts = append(parts, fmt.Sprintf("fall %d", *srv.Fall))
 	}
 
 	// Return space-separated string with leading space
