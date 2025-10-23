@@ -188,14 +188,14 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 			currentRuntimeServers = nil
 		}
 
-		// Build maps for comparison: address:port -> server name (runtime) and desired servers
-		currentServersByAddr := make(map[string]string) // "ip:port" -> server name
+		// Build maps for comparison: address:port -> server (runtime) and desired servers
+		currentServersByAddr := make(map[string]*models.RuntimeServer) // "ip:port" -> RuntimeServer
 		for _, srv := range currentRuntimeServers {
 			addr := srv.Address
 			if srv.Port != nil {
 				addr = fmt.Sprintf("%s:%d", srv.Address, *srv.Port)
 			}
-			currentServersByAddr[addr] = srv.Name
+			currentServersByAddr[addr] = srv
 		}
 
 		desiredServersByAddr := make(map[string]configuration.ServiceServer) // "ip:port" -> ServiceServer
@@ -209,7 +209,7 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 
 		// Add new servers that don't exist yet
 		for addr, srv := range desiredServersByAddr {
-			if existingName, exists := currentServersByAddr[addr]; !exists {
+			if existingServer, exists := currentServersByAddr[addr]; !exists {
 				// Server doesn't exist, add it
 				serverName := s.generateServerName(srv.Address, srv.Port)
 				if err := s.addServerViaRuntime(runtime, backendName, serverName, srv, &haversion); err != nil {
@@ -218,22 +218,24 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 				}
 				log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Added server %s (%s) to backend %s via Runtime API", serverName, addr, backendName)
 			} else {
-				// Server exists with this address, update if needed
-				if err := s.updateServerViaRuntime(runtime, backendName, existingName, srv); err != nil {
-					s.logWarningf("Failed to update server %s (%s) in backend %s: %s", existingName, addr, backendName, err.Error())
-				} else {
-					s.logWarningf("Updated server %s (%s) in backend %s via Runtime API", existingName, addr, backendName)
+				// Server exists with this address, check if update is needed
+				if s.serverNeedsUpdate(existingServer, srv) {
+					if err := s.updateServerViaRuntime(runtime, backendName, existingServer.Name, srv); err != nil {
+						s.logWarningf("Failed to update server %s (%s) in backend %s: %s", existingServer.Name, addr, backendName, err.Error())
+					} else {
+						log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Updated server %s (%s) in backend %s via Runtime API", existingServer.Name, addr, backendName)
+					}
 				}
 			}
 		}
 
 		// Remove servers that no longer exist in desired state
-		for addr, serverName := range currentServersByAddr {
+		for addr, server := range currentServersByAddr {
 			if _, exists := desiredServersByAddr[addr]; !exists {
-				if err := s.deleteServerViaRuntime(runtime, backendName, serverName); err != nil {
-					s.logWarningf("Failed to delete server %s (%s) from backend %s: %s", serverName, addr, backendName, err.Error())
+				if err := s.deleteServerViaRuntime(runtime, backendName, server.Name); err != nil {
+					s.logWarningf("Failed to delete server %s (%s) from backend %s: %s", server.Name, addr, backendName, err.Error())
 				} else {
-					log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Deleted server %s (%s) from backend %s via Runtime API", serverName, addr, backendName)
+					log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Deleted server %s (%s) from backend %s via Runtime API", server.Name, addr, backendName)
 				}
 			}
 		}
@@ -408,6 +410,33 @@ func sanitizeHostname(hostname string) string {
 	// Replace dots, colons, and other special chars with dashes
 	re := regexp.MustCompile(`[^a-zA-Z0-9-]`)
 	return re.ReplaceAllString(hostname, "-")
+}
+
+// serverNeedsUpdate checks if a server's configuration has changed and needs updating
+func (s *ServiceDiscoveryInstance) serverNeedsUpdate(current *models.RuntimeServer, desired configuration.ServiceServer) bool {
+	// Check if address changed
+	if current.Address != desired.Address {
+		return true
+	}
+
+	// Check if port changed
+	currentPort := 0
+	if current.Port != nil {
+		currentPort = int(*current.Port)
+	}
+	desiredPort := 0
+	if desired.Port != nil {
+		desiredPort = int(*desired.Port)
+	}
+	if currentPort != desiredPort {
+		return true
+	}
+
+	// Add more checks here if needed for other server properties
+	// For now, we only check address and port since those are the main fields
+	// that service discovery typically manages
+
+	return false
 }
 
 // addServerViaRuntime adds a server via Runtime API
