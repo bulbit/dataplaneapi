@@ -214,25 +214,33 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 			desiredServersByAddr[addr] = srv
 		}
 
-		// Add new servers that don't exist yet
+		// Process desired servers: add new ones or update existing ones
+		// Key principle: if a server already exists with the same address:port combination,
+		// we MUST respect the existing server name instead of creating a duplicate
 		for addr, srv := range desiredServersByAddr {
 			if existingServer, exists := currentServersByAddr[addr]; !exists {
-				// Server doesn't exist, add it
+				// Server doesn't exist, add it with a generated name
 				serverName := s.generateServerName(srv.Address, srv.Port)
-				if err := s.addServerViaRuntime(runtime, backendName, serverName, srv, &haversion); err != nil {
+				if err := s.addServerViaRuntime(runtime, backendName, serverName, srv, &haversion, currentRuntimeServers); err != nil {
 					s.logErrorf("Failed to add server %s (%s) to backend %s: %s", serverName, addr, backendName, err.Error())
 					s.deleteTransaction()
 					return err
 				}
 				log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Added and enabled server %s (%s) to backend %s via Runtime API", serverName, addr, backendName)
 			} else {
-				// Server exists with this address, check if update is needed
+				// Server already exists with this address:port, respect the existing name
+				existingName := existingServer.Name
+				log.WithFieldsf(s.params.LogFields, log.DebugLevel, "Server with address %s already exists as '%s' in backend %s, respecting existing name", addr, existingName, backendName)
+
+				// Check if update is needed for the existing server
 				if s.serverNeedsUpdate(existingServer, srv) {
-					if err := s.updateServerViaRuntime(runtime, backendName, existingServer.Name, srv); err != nil {
-						s.logWarningf("Failed to update server %s (%s) in backend %s: %s", existingServer.Name, addr, backendName, err.Error())
+					if err := s.updateServerViaRuntime(runtime, backendName, existingName, srv); err != nil {
+						s.logWarningf("Failed to update server %s (%s) in backend %s: %s", existingName, addr, backendName, err.Error())
 					} else {
-						log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Updated server %s (%s) in backend %s via Runtime API", existingServer.Name, addr, backendName)
+						log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Updated server %s (%s) in backend %s via Runtime API", existingName, addr, backendName)
 					}
+				} else {
+					log.WithFieldsf(s.params.LogFields, log.DebugLevel, "Server %s (%s) in backend %s is up to date, no changes needed", existingName, addr, backendName)
 				}
 			}
 		}
@@ -541,8 +549,39 @@ func (s *ServiceDiscoveryInstance) getBackendConfiguration(backendName string) *
 	return config
 }
 
+// findExistingServerByAddress finds an existing server with the same address:port combination
+// from a pre-fetched list of servers to avoid redundant API calls
+func (s *ServiceDiscoveryInstance) findExistingServerByAddress(servers []*models.RuntimeServer, srv configuration.ServiceServer) *models.RuntimeServer {
+	targetAddr := srv.Address
+	if srv.Port != nil {
+		targetAddr = fmt.Sprintf("%s:%d", srv.Address, *srv.Port)
+	}
+
+	for _, server := range servers {
+		serverAddr := server.Address
+		if server.Port != nil {
+			serverAddr = fmt.Sprintf("%s:%d", server.Address, *server.Port)
+		}
+		if serverAddr == targetAddr {
+			return server
+		}
+	}
+	return nil
+}
+
 // addServerViaRuntime adds a server via Runtime API and enables it
-func (s *ServiceDiscoveryInstance) addServerViaRuntime(runtime cn_runtime.Runtime, backendName, serverName string, srv configuration.ServiceServer, haversion *cn_runtime.HAProxyVersion) error {
+// This method includes a safety check to avoid adding duplicate servers with different names
+func (s *ServiceDiscoveryInstance) addServerViaRuntime(runtime cn_runtime.Runtime, backendName, serverName string, srv configuration.ServiceServer, haversion *cn_runtime.HAProxyVersion, currentServers []*models.RuntimeServer) error {
+	// Safety check: ensure we don't add a server that already exists with a different name
+	existingServer := s.findExistingServerByAddress(currentServers, srv)
+	if existingServer != nil {
+		// Server already exists with this address:port, respect the existing name
+		s.logWarningf("Server with address %s:%v already exists as '%s' in backend %s, cannot add new server '%s'",
+			srv.Address, srv.Port, existingServer.Name, backendName, serverName)
+		return fmt.Errorf("server with address %s:%v already exists as '%s', cannot add duplicate with name '%s'",
+			srv.Address, srv.Port, existingServer.Name, serverName)
+	}
+
 	// Get comprehensive backend configuration including health checks
 	backendConfig := s.getBackendConfiguration(backendName)
 
