@@ -477,8 +477,7 @@ type BackendConfig struct {
 	Inter           *int64
 	Rise            *int64
 	Fall            *int64
-	CheckProto      string
-	UseHTTP         bool
+	UseHTTP         bool   // Whether backend uses HTTP health checks
 	Weight          *int64 // Default server weight
 	Maxconn         *int64 // Maximum connections per server
 	HealthCheckAddr string // Custom health check address
@@ -491,11 +490,10 @@ type BackendConfig struct {
 func (s *ServiceDiscoveryInstance) getBackendConfiguration(backendName string) *BackendConfig {
 	// Default fallback values (HAProxy defaults)
 	config := &BackendConfig{
-		Inter:      &[]int64{2000}[0], // 2 seconds
-		Rise:       &[]int64{2}[0],    // 2 successful checks
-		Fall:       &[]int64{3}[0],    // 3 failed checks
-		CheckProto: "",                // Default to TCP checks
-		UseHTTP:    false,
+		Inter:   &[]int64{2000}[0], // 2 seconds
+		Rise:    &[]int64{2}[0],    // 2 successful checks
+		Fall:    &[]int64{3}[0],    // 3 failed checks before DOWN
+		UseHTTP: false,             // Default to TCP health checks
 	}
 
 	// Try to get backend configuration
@@ -508,7 +506,6 @@ func (s *ServiceDiscoveryInstance) getBackendConfiguration(backendName string) *
 	// Check if backend uses HTTP health checks
 	if backend.AdvCheck == "httpchk" && backend.HttpchkParams != nil {
 		config.UseHTTP = true
-		config.CheckProto = "HTTP"
 		s.logWarningf("Backend %s uses HTTP health checks: %s %s %s",
 			backendName, backend.HttpchkParams.Method, backend.HttpchkParams.URI, backend.HttpchkParams.Version)
 	}
@@ -549,8 +546,8 @@ func (s *ServiceDiscoveryInstance) getBackendConfiguration(backendName string) *
 		}
 	}
 
-	s.logWarningf("Backend %s configuration: inter=%dms, rise=%d, fall=%d, http=%t, proto=%s",
-		backendName, *config.Inter, *config.Rise, *config.Fall, config.UseHTTP, config.CheckProto)
+	s.logWarningf("Backend %s configuration: inter=%dms, rise=%d, fall=%d, http=%t",
+		backendName, *config.Inter, *config.Rise, *config.Fall, config.UseHTTP)
 
 	// Log additional inherited settings if present
 	if config.Weight != nil {
@@ -599,9 +596,8 @@ func (s *ServiceDiscoveryInstance) addServerViaRuntime(runtime cn_runtime.Runtim
 		ras.HealthCheckPort = backendConfig.HealthCheckPort
 	}
 
-	// Conditionally add HTTP check configuration if backend uses HTTP checks
+	// Log if backend uses HTTP health checks (no special configuration needed for Runtime API)
 	if backendConfig.UseHTTP {
-		ras.CheckProto = backendConfig.CheckProto
 		s.logWarningf("Configuring server %s with HTTP health checks to match backend's HTTP check configuration", serverName)
 	}
 
@@ -679,10 +675,9 @@ func serializeRuntimeAddServer(srv *models.RuntimeAddServer, haversion *cn_runti
 		parts = append(parts, "check")
 	}
 
-	// Add health check protocol (HTTP, TCP, etc.)
-	if srv.CheckProto != "" {
-		parts = append(parts, fmt.Sprintf("check-proto %s", srv.CheckProto))
-	}
+	// Note: check-proto is NOT supported in Runtime API
+	// HTTP health checks are configured via the backend's httpchk directive
+	// and are automatically applied when 'check' is enabled
 
 	// Add check interval if specified
 	if srv.Inter != nil {
