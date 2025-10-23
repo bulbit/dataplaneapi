@@ -472,66 +472,137 @@ func (s *ServiceDiscoveryInstance) serverNeedsUpdate(current *models.RuntimeServ
 	return false
 }
 
-// getBackendHealthCheckDefaults retrieves health check defaults from backend's default-server directive
-func (s *ServiceDiscoveryInstance) getBackendHealthCheckDefaults(backendName string) (inter, rise, fall *int64) {
+// BackendConfig holds comprehensive backend configuration for server creation
+type BackendConfig struct {
+	Inter           *int64
+	Rise            *int64
+	Fall            *int64
+	CheckProto      string
+	UseHTTP         bool
+	Weight          *int64 // Default server weight
+	Maxconn         *int64 // Maximum connections per server
+	HealthCheckAddr string // Custom health check address
+	HealthCheckPort *int64 // Custom health check port
+	Downinter       *int64 // Check interval when server is down
+	Fastinter       *int64 // Check interval during startup
+}
+
+// getBackendConfiguration retrieves comprehensive backend configuration including health checks
+func (s *ServiceDiscoveryInstance) getBackendConfiguration(backendName string) *BackendConfig {
 	// Default fallback values (HAProxy defaults)
-	defaultInter := int64(2000) // 2 seconds
-	defaultRise := int64(2)     // 2 successful checks
-	defaultFall := int64(3)     // 3 failed checks
+	config := &BackendConfig{
+		Inter:      &[]int64{2000}[0], // 2 seconds
+		Rise:       &[]int64{2}[0],    // 2 successful checks
+		Fall:       &[]int64{3}[0],    // 3 failed checks
+		CheckProto: "",                // Default to TCP checks
+		UseHTTP:    false,
+	}
 
 	// Try to get backend configuration
 	_, backend, err := s.client.GetBackend(backendName, "")
 	if err != nil {
-		// If we can't get backend config, use defaults
-		return &defaultInter, &defaultRise, &defaultFall
+		s.logWarningf("Could not retrieve backend %s configuration, using defaults: %s", backendName, err.Error())
+		return config
+	}
+
+	// Check if backend uses HTTP health checks
+	if backend.AdvCheck == "httpchk" && backend.HttpchkParams != nil {
+		config.UseHTTP = true
+		config.CheckProto = "HTTP"
+		s.logWarningf("Backend %s uses HTTP health checks: %s %s %s",
+			backendName, backend.HttpchkParams.Method, backend.HttpchkParams.URI, backend.HttpchkParams.Version)
 	}
 
 	// Read from backend's default-server directive if available
 	if backend.DefaultServer != nil {
-		// Get inter (check interval) from default-server
+		// Health check timing parameters
 		if backend.DefaultServer.Inter != nil && *backend.DefaultServer.Inter > 0 {
-			inter = backend.DefaultServer.Inter
+			config.Inter = backend.DefaultServer.Inter
 		}
-
-		// Get rise (consecutive successful checks before UP) from default-server
 		if backend.DefaultServer.Rise != nil && *backend.DefaultServer.Rise > 0 {
-			rise = backend.DefaultServer.Rise
+			config.Rise = backend.DefaultServer.Rise
 		}
-
-		// Get fall (consecutive failed checks before DOWN) from default-server
 		if backend.DefaultServer.Fall != nil && *backend.DefaultServer.Fall > 0 {
-			fall = backend.DefaultServer.Fall
+			config.Fall = backend.DefaultServer.Fall
+		}
+		if backend.DefaultServer.Downinter != nil && *backend.DefaultServer.Downinter > 0 {
+			config.Downinter = backend.DefaultServer.Downinter
+		}
+		if backend.DefaultServer.Fastinter != nil && *backend.DefaultServer.Fastinter > 0 {
+			config.Fastinter = backend.DefaultServer.Fastinter
+		}
+
+		// Server capacity and connection parameters
+		if backend.DefaultServer.Weight != nil && *backend.DefaultServer.Weight > 0 {
+			config.Weight = backend.DefaultServer.Weight
+		}
+		if backend.DefaultServer.Maxconn != nil && *backend.DefaultServer.Maxconn > 0 {
+			config.Maxconn = backend.DefaultServer.Maxconn
+		}
+
+		// Custom health check address/port
+		if backend.DefaultServer.HealthCheckAddress != "" {
+			config.HealthCheckAddr = backend.DefaultServer.HealthCheckAddress
+		}
+		if backend.DefaultServer.HealthCheckPort != nil && *backend.DefaultServer.HealthCheckPort > 0 {
+			config.HealthCheckPort = backend.DefaultServer.HealthCheckPort
 		}
 	}
 
-	// Fall back to hardcoded defaults if not specified in backend
-	if inter == nil {
-		inter = &defaultInter
+	s.logWarningf("Backend %s configuration: inter=%dms, rise=%d, fall=%d, http=%t, proto=%s",
+		backendName, *config.Inter, *config.Rise, *config.Fall, config.UseHTTP, config.CheckProto)
+
+	// Log additional inherited settings if present
+	if config.Weight != nil {
+		s.logWarningf("Backend %s: default server weight=%d", backendName, *config.Weight)
 	}
-	if rise == nil {
-		rise = &defaultRise
+	if config.Maxconn != nil {
+		s.logWarningf("Backend %s: default server maxconn=%d", backendName, *config.Maxconn)
 	}
-	if fall == nil {
-		fall = &defaultFall
+	if config.HealthCheckAddr != "" {
+		s.logWarningf("Backend %s: custom health check address=%s", backendName, config.HealthCheckAddr)
 	}
 
-	return inter, rise, fall
+	return config
 }
 
 // addServerViaRuntime adds a server via Runtime API and enables it
 func (s *ServiceDiscoveryInstance) addServerViaRuntime(runtime cn_runtime.Runtime, backendName, serverName string, srv configuration.ServiceServer, haversion *cn_runtime.HAProxyVersion) error {
-	// Get health check defaults from backend configuration
-	inter, rise, fall := s.getBackendHealthCheckDefaults(backendName)
-	s.logWarningf("Health check defaults for backend %s: inter=%d, rise=%d, fall=%d", backendName, *inter, *rise, *fall)
+	// Get comprehensive backend configuration including health checks
+	backendConfig := s.getBackendConfiguration(backendName)
 
 	ras := &models.RuntimeAddServer{
 		Name:    serverName,
 		Address: srv.Address,
 		Port:    srv.Port,
-		Check:   "enabled", // Enable health checks
-		Inter:   inter,     // Check interval from backend config
-		Rise:    rise,      // Rise threshold from backend config
-		Fall:    fall,      // Fall threshold from backend config
+		Check:   "enabled",             // Enable health checks
+		Inter:   backendConfig.Inter,   // Check interval from backend config
+		Rise:    backendConfig.Rise,    // Rise threshold from backend config
+		Fall:    backendConfig.Fall,    // Fall threshold from backend config
+		Weight:  backendConfig.Weight,  // Server weight from backend config
+		Maxconn: backendConfig.Maxconn, // Max connections from backend config
+	}
+
+	// Add advanced health check timing if configured
+	if backendConfig.Downinter != nil {
+		ras.Downinter = backendConfig.Downinter
+	}
+	if backendConfig.Fastinter != nil {
+		ras.Fastinter = backendConfig.Fastinter
+	}
+
+	// Add custom health check address/port if configured
+	if backendConfig.HealthCheckAddr != "" {
+		ras.HealthCheckAddress = backendConfig.HealthCheckAddr
+	}
+	if backendConfig.HealthCheckPort != nil {
+		ras.HealthCheckPort = backendConfig.HealthCheckPort
+	}
+
+	// Conditionally add HTTP check configuration if backend uses HTTP checks
+	if backendConfig.UseHTTP {
+		ras.CheckProto = backendConfig.CheckProto
+		s.logWarningf("Configuring server %s with HTTP health checks to match backend's HTTP check configuration", serverName)
 	}
 
 	serialized := serializeRuntimeAddServer(ras, haversion)
@@ -542,6 +613,12 @@ func (s *ServiceDiscoveryInstance) addServerViaRuntime(runtime cn_runtime.Runtim
 		return err
 	}
 	s.logWarningf("Successfully added server %s to backend %s", serverName, backendName)
+
+	// Check server state immediately after adding
+	if serverState, err := runtime.GetServerState(backendName, serverName); err == nil {
+		s.logWarningf("Server %s state after adding: AdminState=%s, OperationalState=%s",
+			serverName, serverState.AdminState, serverState.OperationalState)
+	}
 
 	// Servers are added in MAINT state by default, need to enable them
 	s.logWarningf("Enabling server %s in backend %s", serverName, backendName)
@@ -602,9 +679,14 @@ func serializeRuntimeAddServer(srv *models.RuntimeAddServer, haversion *cn_runti
 		parts = append(parts, "check")
 	}
 
+	// Add health check protocol (HTTP, TCP, etc.)
+	if srv.CheckProto != "" {
+		parts = append(parts, fmt.Sprintf("check-proto %s", srv.CheckProto))
+	}
+
 	// Add check interval if specified
 	if srv.Inter != nil {
-		parts = append(parts, fmt.Sprintf("inter %dms", *srv.Inter))
+		parts = append(parts, fmt.Sprintf("inter %d", *srv.Inter))
 	}
 
 	// Add rise threshold (number of successful checks before UP)
@@ -615,6 +697,36 @@ func serializeRuntimeAddServer(srv *models.RuntimeAddServer, haversion *cn_runti
 	// Add fall threshold (number of failed checks before DOWN)
 	if srv.Fall != nil {
 		parts = append(parts, fmt.Sprintf("fall %d", *srv.Fall))
+	}
+
+	// Add server weight
+	if srv.Weight != nil {
+		parts = append(parts, fmt.Sprintf("weight %d", *srv.Weight))
+	}
+
+	// Add maximum connections
+	if srv.Maxconn != nil {
+		parts = append(parts, fmt.Sprintf("maxconn %d", *srv.Maxconn))
+	}
+
+	// Add down interval (check interval when server is down)
+	if srv.Downinter != nil {
+		parts = append(parts, fmt.Sprintf("downinter %d", *srv.Downinter))
+	}
+
+	// Add fast interval (check interval during startup)
+	if srv.Fastinter != nil {
+		parts = append(parts, fmt.Sprintf("fastinter %d", *srv.Fastinter))
+	}
+
+	// Add custom health check address
+	if srv.HealthCheckAddress != "" {
+		parts = append(parts, fmt.Sprintf("addr %s", srv.HealthCheckAddress))
+	}
+
+	// Add custom health check port
+	if srv.HealthCheckPort != nil {
+		parts = append(parts, fmt.Sprintf("port %d", *srv.HealthCheckPort))
 	}
 
 	// Return space-separated string with leading space
