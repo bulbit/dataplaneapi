@@ -127,22 +127,26 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 	isStatsSocket := runtime.IsStatsSocket()
 	s.logWarningf("Runtime API using socket: %s (isStatsSocket: %t)", socketPath, isStatsSocket)
 
-	// Try to get HAProxy version, but continue if it fails since our
-	// serializeRuntimeAddServer implementation doesn't actually use it
-	haversion, err := runtime.GetVersion()
-	if err != nil {
-		// Create a default version mimicking 3.2.0 to avoid nil pointer issues
-		haversion = cn_runtime.HAProxyVersion{Major: 3, Minor: 2, Patch: 0}
-		s.logWarningf("Failed to get HAProxy version, continuing with default version (Major=%d, Minor=%d, Patch=%d): %s", haversion.Major, haversion.Minor, haversion.Patch, err.Error())
-
-		// Note: GetVersion() failed, likely due to client-native library issue with master socket handling
-		// This is a known issue where the library incorrectly routes commands to non-existent workers
-
-		// Since we can't set the version on the runtime client, and AddServer will likely fail
-		// with version checks, we should return an error to fallback to config file method
-		return fmt.Errorf("runtime version unavailable, cannot use Runtime API: %w", err)
-	} else {
-		s.logWarningf("Successfully retrieved HAProxy version: Major=%d, Minor=%d, Patch=%d", haversion.Major, haversion.Minor, haversion.Patch)
+	// Initialize serverStates by reading current runtime state from HAProxy
+	// This ensures we track existing servers (including those from config file)
+	for _, service := range services {
+		if s.serviceNotTracked(service.GetName()) {
+			continue
+		}
+		backendName := service.GetBackendName()
+		if _, ok := s.serverStates[backendName]; !ok {
+			s.serverStates[backendName] = make(map[string]bool)
+			// Read existing servers from HAProxy runtime
+			existingServers, err := runtime.GetServersState(backendName)
+			if err != nil {
+				s.logWarningf("Failed to get existing servers for backend %s: %s", backendName, err.Error())
+			} else {
+				for _, srv := range existingServers {
+					s.serverStates[backendName][srv.Name] = true
+					s.logWarningf("Found existing server %s in backend %s (address: %s)", srv.Name, backendName, srv.Address)
+				}
+			}
+		}
 	}
 
 	s.markForCleanUp()
@@ -153,11 +157,6 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 		}
 
 		backendName := service.GetBackendName()
-
-		// Initialize backend state tracking if not exists
-		if _, ok := s.serverStates[backendName]; !ok {
-			s.serverStates[backendName] = make(map[string]bool)
-		}
 
 		if !service.Changed() {
 			if se, ok := s.services[service.GetName()]; ok {
@@ -175,41 +174,60 @@ func (s *ServiceDiscoveryInstance) updateServicesViaRuntime(services []ServiceIn
 		se.cleanup = false
 
 		desiredServers := service.GetServers()
-		currentServers := s.serverStates[backendName]
 
-		// Create a map of desired servers
-		desiredServerMap := make(map[string]configuration.ServiceServer)
-		for _, srv := range desiredServers {
-			serverName := s.generateServerName(srv.Address, srv.Port)
-			desiredServerMap[serverName] = srv
+		// Get current runtime state for this backend to match by address
+		currentRuntimeServers, err := runtime.GetServersState(backendName)
+		if err != nil {
+			s.logWarningf("Failed to get current servers for backend %s: %s", backendName, err.Error())
+			currentRuntimeServers = nil
 		}
 
-		// Add new servers and update existing ones
-		for serverName, srv := range desiredServerMap {
-			if !currentServers[serverName] {
-				// Add new server via Runtime API
+		// Build maps for comparison: address:port -> server name (runtime) and desired servers
+		currentServersByAddr := make(map[string]string) // "ip:port" -> server name
+		for _, srv := range currentRuntimeServers {
+			addr := srv.Address
+			if srv.Port != nil {
+				addr = fmt.Sprintf("%s:%d", srv.Address, *srv.Port)
+			}
+			currentServersByAddr[addr] = srv.Name
+		}
+
+		desiredServersByAddr := make(map[string]configuration.ServiceServer) // "ip:port" -> ServiceServer
+		for _, srv := range desiredServers {
+			addr := srv.Address
+			if srv.Port != nil {
+				addr = fmt.Sprintf("%s:%d", srv.Address, *srv.Port)
+			}
+			desiredServersByAddr[addr] = srv
+		}
+
+		// Add new servers that don't exist yet
+		for addr, srv := range desiredServersByAddr {
+			if existingName, exists := currentServersByAddr[addr]; !exists {
+				// Server doesn't exist, add it
+				serverName := s.generateServerName(srv.Address, srv.Port)
 				if err := s.addServerViaRuntime(runtime, backendName, serverName, srv, &haversion); err != nil {
-					s.logErrorf("Failed to add server %s to backend %s: %s", serverName, backendName, err.Error())
+					s.logErrorf("Failed to add server %s (%s) to backend %s: %s", serverName, addr, backendName, err.Error())
 					return err
 				}
-				s.serverStates[backendName][serverName] = true
-				log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Added server %s to backend %s via Runtime API", serverName, backendName)
+				log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Added server %s (%s) to backend %s via Runtime API", serverName, addr, backendName)
 			} else {
-				// Server exists, update address if needed via Runtime API
-				if err := s.updateServerViaRuntime(runtime, backendName, serverName, srv); err != nil {
-					s.logWarningf("Failed to update server %s in backend %s: %s", serverName, backendName, err.Error())
+				// Server exists with this address, update if needed
+				if err := s.updateServerViaRuntime(runtime, backendName, existingName, srv); err != nil {
+					s.logWarningf("Failed to update server %s (%s) in backend %s: %s", existingName, addr, backendName, err.Error())
+				} else {
+					s.logWarningf("Updated server %s (%s) in backend %s via Runtime API", existingName, addr, backendName)
 				}
 			}
 		}
 
-		// Remove servers that no longer exist
-		for serverName := range currentServers {
-			if _, exists := desiredServerMap[serverName]; !exists {
+		// Remove servers that no longer exist in desired state
+		for addr, serverName := range currentServersByAddr {
+			if _, exists := desiredServersByAddr[addr]; !exists {
 				if err := s.deleteServerViaRuntime(runtime, backendName, serverName); err != nil {
-					s.logWarningf("Failed to delete server %s from backend %s: %s", serverName, backendName, err.Error())
+					s.logWarningf("Failed to delete server %s (%s) from backend %s: %s", serverName, addr, backendName, err.Error())
 				} else {
-					delete(s.serverStates[backendName], serverName)
-					log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Deleted server %s from backend %s via Runtime API", serverName, backendName)
+					log.WithFieldsf(s.params.LogFields, log.InfoLevel, "Deleted server %s (%s) from backend %s via Runtime API", serverName, addr, backendName)
 				}
 			}
 		}
