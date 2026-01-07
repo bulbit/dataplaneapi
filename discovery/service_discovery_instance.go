@@ -486,6 +486,7 @@ type BackendConfig struct {
 	HealthCheckPort *int64 // Custom health check port
 	Downinter       *int64 // Check interval when server is down
 	Fastinter       *int64 // Check interval during startup
+	Proto           string // Protocol (e.g., "h2" for HTTP/2)
 }
 
 // getBackendConfiguration retrieves comprehensive backend configuration including health checks
@@ -543,6 +544,11 @@ func (s *ServiceDiscoveryInstance) getBackendConfiguration(backendName string) *
 		}
 		if backend.DefaultServer.HealthCheckPort != nil && *backend.DefaultServer.HealthCheckPort > 0 {
 			config.HealthCheckPort = backend.DefaultServer.HealthCheckPort
+		}
+
+		// Protocol configuration (e.g., h2 for HTTP/2)
+		if backend.DefaultServer.Proto != "" {
+			config.Proto = backend.DefaultServer.Proto
 		}
 	}
 
@@ -611,6 +617,11 @@ func (s *ServiceDiscoveryInstance) addServerViaRuntime(runtime cn_runtime.Runtim
 	}
 	if backendConfig.HealthCheckPort != nil {
 		ras.HealthCheckPort = backendConfig.HealthCheckPort
+	}
+
+	// Add protocol if configured (e.g., h2 for HTTP/2)
+	if backendConfig.Proto != "" {
+		ras.Proto = backendConfig.Proto
 	}
 
 	serialized := serializeRuntimeAddServer(ras, haversion)
@@ -728,6 +739,11 @@ func serializeRuntimeAddServer(srv *models.RuntimeAddServer, haversion *cn_runti
 	// Add custom health check port
 	if srv.HealthCheckPort != nil {
 		parts = append(parts, fmt.Sprintf("port %d", *srv.HealthCheckPort))
+	}
+
+	// Add protocol (e.g., h2 for HTTP/2)
+	if srv.Proto != "" {
+		parts = append(parts, fmt.Sprintf("proto %s", srv.Proto))
 	}
 
 	// Return space-separated string with leading space
